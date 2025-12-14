@@ -22,6 +22,11 @@ public class AppleTaskConfig {
     public String location;
     public String cronExpressions;
     public String country;
+    /**
+     * Apple 網站的 Cookie，可從瀏覽器開發者工具中複製
+     * 用於繞過反爬蟲檢測，提高請求成功率
+     */
+    public String cookie;
 
     public boolean valid() {
         if (CollectionUtil.isEmpty(deviceCodeList)) {
@@ -70,7 +75,6 @@ public class AppleTaskConfig {
 
             });
         });
-
 
         log.info("配置校验通过，开始监控{}附近的Apple直营店", location);
 

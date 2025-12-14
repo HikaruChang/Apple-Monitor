@@ -1,6 +1,7 @@
 package top.misec.applemonitor.job;
 
 import cn.hutool.core.util.CharsetUtil;
+import cn.hutool.core.util.RandomUtil;
 import cn.hutool.core.util.StrUtil;
 import cn.hutool.core.util.URLUtil;
 import cn.hutool.http.Header;
@@ -16,7 +17,6 @@ import top.misec.bark.BarkPush;
 import top.misec.bark.enums.SoundEnum;
 import top.misec.bark.pojo.PushDetails;
 
-import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -28,22 +28,26 @@ import java.util.Map;
 public class AppleMonitor {
     private final AppCfg CONFIG = CfgSingleton.getInstance().config;
 
+    /**
+     * 最大重試次數
+     */
+    private static final int MAX_RETRY = 3;
 
     public void monitor() {
 
         List<DeviceItem> deviceItemList = CONFIG.getAppleTaskConfig().getDeviceCodeList();
-        //监视机型型号
+        // 监视机型型号
 
         try {
             for (DeviceItem deviceItem : deviceItemList) {
                 doMonitor(deviceItem);
-                Thread.sleep(1500);
+                // 隨機延遲 5-12 秒，模擬真實用戶行為
+                Thread.sleep(RandomUtil.randomInt(5000, 12000));
             }
         } catch (Exception e) {
             log.error("AppleMonitor Error", e);
         }
     }
-
 
     public void pushAll(String content, List<PushConfig> pushConfigs) {
 
@@ -51,12 +55,13 @@ public class AppleMonitor {
 
             if (StrUtil.isAllNotEmpty(push.getBarkPushUrl(), push.getBarkPushToken())) {
                 BarkPush barkPush = new BarkPush(push.getBarkPushUrl(), push.getBarkPushToken());
-                PushDetails pushDetails= PushDetails.builder()
+                PushDetails pushDetails = PushDetails.builder()
                         .title("苹果商店监控")
                         .body(content)
                         .category("苹果商店监控")
                         .group("Apple Monitor")
-                        .sound(StrUtil.isEmpty(push.getBarkPushSound()) ? SoundEnum.GLASS.getSoundName() : push.getBarkPushSound())
+                        .sound(StrUtil.isEmpty(push.getBarkPushSound()) ? SoundEnum.GLASS.getSoundName()
+                                : push.getBarkPushSound())
                         .build();
                 barkPush.simpleWithResp(pushDetails);
             }
@@ -81,22 +86,18 @@ public class AppleMonitor {
 
         String baseCountryUrl = CountryEnum.getUrlByCountry(CONFIG.getAppleTaskConfig().getCountry());
 
-        Map<String, List<String>> headers = buildHeaders(baseCountryUrl, deviceItem.getDeviceCode());
-
-        String url = baseCountryUrl + "/shop/fulfillment-messages?" + URLUtil.buildQuery(queryMap, CharsetUtil.CHARSET_UTF_8);
+        String url = baseCountryUrl + "/shop/fulfillment-messages?"
+                + URLUtil.buildQuery(queryMap, CharsetUtil.CHARSET_UTF_8);
 
         try {
-            JSONObject responseJsonObject;
-            try (HttpResponse httpResponse = HttpRequest.get(url).header(headers).execute()) {
-                if (!httpResponse.isOk()) {
-                    log.info("请求过于频繁，请调整cronExpressions，建议您参考推荐的cron表达式");
-                    return;
-                }
+            JSONObject responseJsonObject = executeRequestWithRetry(url, baseCountryUrl, deviceItem.getDeviceCode());
 
-                responseJsonObject = JSONObject.parseObject(httpResponse.body());
+            if (responseJsonObject == null) {
+                return;
             }
 
-            JSONObject pickupMessage = responseJsonObject.getJSONObject("body").getJSONObject("content").getJSONObject("pickupMessage");
+            JSONObject pickupMessage = responseJsonObject.getJSONObject("body").getJSONObject("content")
+                    .getJSONObject("pickupMessage");
 
             JSONArray stores = pickupMessage.getJSONArray("stores");
 
@@ -123,9 +124,10 @@ public class AppleMonitor {
                 JSONObject partsAvailability = storeJson.getJSONObject("partsAvailability");
 
                 String storeNames = storeJson.getString("storeName").trim();
-                String deviceName = partsAvailability.getJSONObject(deviceItem.getDeviceCode()).getJSONObject("messageTypes").getJSONObject("regular").getString("storePickupProductTitle");
-                String productStatus = partsAvailability.getJSONObject(deviceItem.getDeviceCode()).getString("pickupSearchQuote");
-
+                String deviceName = partsAvailability.getJSONObject(deviceItem.getDeviceCode())
+                        .getJSONObject("messageTypes").getJSONObject("regular").getString("storePickupProductTitle");
+                String productStatus = partsAvailability.getJSONObject(deviceItem.getDeviceCode())
+                        .getString("pickupSearchQuote");
 
                 String strTemp = "门店:{},型号:{},状态:{}";
 
@@ -138,7 +140,6 @@ public class AppleMonitor {
 
                     pushAll(content, deviceItem.getPushConfigs());
 
-
                 }
                 log.info(content);
             });
@@ -148,7 +149,6 @@ public class AppleMonitor {
         }
 
     }
-
 
     /**
      * check store inventory
@@ -194,7 +194,71 @@ public class AppleMonitor {
     }
 
     /**
-     * build request headers
+     * 執行帶有重試機制的 HTTP 請求
+     *
+     * @param url            請求 URL
+     * @param baseCountryUrl 基礎國家 URL
+     * @param productCode    產品代碼
+     * @return 響應 JSON 對象，失敗返回 null
+     */
+    private JSONObject executeRequestWithRetry(String url, String baseCountryUrl, String productCode) {
+        for (int retry = 0; retry < MAX_RETRY; retry++) {
+            try {
+                // 每次重試前隨機延遲
+                if (retry > 0) {
+                    int delay = RandomUtil.randomInt(5000, 15000);
+                    log.debug("第 {} 次重試，等待 {} 毫秒", retry + 1, delay);
+                    Thread.sleep(delay);
+                }
+
+                Map<String, List<String>> headers = buildHeaders(baseCountryUrl, productCode);
+
+                // 清除 Hutool 默認的 headers，使用 clearHeaders() 確保不會添加額外 headers
+                HttpRequest request = HttpRequest.get(url)
+                        .clearHeaders() // 清除所有默認 headers
+                        .timeout(30000)
+                        .setFollowRedirects(true);
+
+                // 逐一設置 headers（不使用 header(Map) 以避免重複）
+                headers.forEach((key, values) -> {
+                    if (values != null && !values.isEmpty()) {
+                        request.header(key, values.get(0), false); // false = 不追加，覆蓋
+                    }
+                });
+
+                // 調試：輸出請求 headers
+                if (retry == 0) {
+                    log.debug("Request URL: {}", url);
+                    log.debug("Request Headers: {}", request.headers());
+                }
+
+                try (HttpResponse httpResponse = request.execute()) {
+
+                    int statusCode = httpResponse.getStatus();
+
+                    if (httpResponse.isOk()) {
+                        return JSONObject.parseObject(httpResponse.body());
+                    }
+
+                    if (statusCode == 403 || statusCode == 429 || statusCode == 541) {
+                        log.warn("請求被限制 (HTTP {}), 第 {} 次重試...", statusCode, retry + 1);
+                        continue;
+                    }
+
+                    log.info("請求失敗 (HTTP {})，請稍後再試", statusCode);
+                    return null;
+                }
+            } catch (Exception e) {
+                log.warn("請求異常，第 {} 次重試: {}", retry + 1, e.getMessage());
+            }
+        }
+
+        log.info("請求過於頻繁，已達最大重試次數，請調整 cronExpressions，建議您參考推薦的 cron 表達式");
+        return null;
+    }
+
+    /**
+     * build request headers - 完全匹配瀏覽器請求
      *
      * @param baseCountryUrl base country url
      * @param productCode    product code
@@ -202,11 +266,34 @@ public class AppleMonitor {
      */
     private Map<String, List<String>> buildHeaders(String baseCountryUrl, String productCode) {
 
-        ArrayList<String> referer = new ArrayList<>();
-        referer.add(baseCountryUrl + "/shop/buy-iphone/iphone-14-pro/" + productCode);
+        Map<String, List<String>> headers = new HashMap<>(16);
 
-        Map<String, List<String>> headers = new HashMap<>(10);
-        headers.put(Header.REFERER.getValue(), referer);
+        // 固定使用 Chrome 143 的 User-Agent（與成功的 curl 一致）
+        headers.put(Header.USER_AGENT.getValue(), List.of(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36"));
+
+        // Referer
+        headers.put(Header.REFERER.getValue(), List.of(baseCountryUrl + "/shop/buy-iphone/iphone-17-pro"));
+
+        // Accept headers
+        headers.put(Header.ACCEPT.getValue(), List.of("*/*"));
+        headers.put(Header.ACCEPT_LANGUAGE.getValue(), List.of("zh-CN,zh-TW;q=0.9"));
+
+        // Sec-CH-UA 系列 headers（與 Chrome 143 匹配）
+        headers.put("sec-ch-ua", List.of("\"Google Chrome\";v=\"143\""));
+        headers.put("sec-ch-ua-mobile", List.of("?0"));
+        headers.put("sec-ch-ua-platform", List.of("\"macOS\""));
+
+        // Sec-Fetch headers
+        headers.put("Sec-Fetch-Dest", List.of("empty"));
+        headers.put("Sec-Fetch-Mode", List.of("cors"));
+        headers.put("Sec-Fetch-Site", List.of("same-origin"));
+
+        // 添加 Cookie
+        String cookie = CONFIG.getAppleTaskConfig().getCookie();
+        if (StrUtil.isNotBlank(cookie)) {
+            headers.put(Header.COOKIE.getValue(), List.of(cookie));
+        }
 
         return headers;
     }
